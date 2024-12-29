@@ -306,20 +306,20 @@ if PILImage.Image.__name__ != 'EncryptedImage':
         if isinstance(fp, bytes):
             return encode_pil_to_base64(fp)
 
-        original_img = super_open(fp, *args, **kwargs)
+        img = super_open(fp, *args, **kwargs)
         try:
-            pnginfo = original_img.info or {}
+            pnginfo = img.info or {}
 
-            if password and original_img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
+            if password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
                 if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
-                    decrypted_img = PILImage.fromarray(decrypt_image_v3(original_img, get_sha256(password)))
-                    original_img.paste(decrypted_img)
+                    decrypted_img = PILImage.fromarray(decrypt_image_v3(img, get_sha256(password)))
+                    img.paste(decrypted_img)
                     decrypted_img.close()
                     pnginfo["Encrypt"] = None
                     
-            return EncryptedImage.from_image(original_img)
+            return EncryptedImage.from_image(img)
         finally:
-            original_img.close()
+            img.close()
 
     def encode_pil_to_base64(img: PILImage.Image):
         pnginfo = img.info or {}
