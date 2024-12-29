@@ -2,9 +2,9 @@ from PIL import Image
 import hashlib
 import numpy as np
 
-def get_range(input:str,offset:int,range_len=4):
+def get_range(input: str, offset: int, range_len=4):
     offset = offset % len(input)
-    return (input*2)[offset:offset+range_len]
+    return (input * 2)[offset:offset + range_len]
 
 def get_sha256(input: str):
     return hashlib.sha256(input.encode('utf-8')).hexdigest()
