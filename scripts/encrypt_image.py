@@ -1,16 +1,25 @@
-import base64, io, sys, os
+import io
+import os
+import sys
+import time
+import base64
+import threading
 import gradio as gr
-from io import BytesIO
+
 from pathlib import Path
-from typing import Optional
+from queue import Queue, Empty
 from urllib.parse import unquote
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, Response
 from PIL import Image as PILImage, PngImagePlugin, _util, ImagePalette
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
+from modules import shared, script_callbacks, images
 from modules.api import api
-from modules.shared import opts
-from modules import shared, sd_models, script_callbacks, scripts as md_scripts, images
-from scripts.core.core import decrypt_image, decrypt_image_v2, decrypt_image_v3, get_sha256, encrypt_image_v3
+from modules.paths_internal import models_path
+
+from scripts.encrypt_core import decrypt_image_v3, get_sha256, encrypt_image_v3
 
 RST = '\033[0m'
 ORG = '\033[38;5;208m'
@@ -19,124 +28,38 @@ BLUE = '\033[38;5;39m'
 RED = '\033[38;5;196m'
 TITLE = 'Image Encryption:'
 
-ckpt_dir = shared.cmd_opts.ckpt_dir or sd_models.model_path
-lora_dir = shared.cmd_opts.lora_dir
 emb_dir  = shared.cmd_opts.embeddings_dir
-vae_dir  = Path(shared.models_path) / 'VAE'
+models = Path(models_path)
 
 password = getattr(shared.cmd_opts, 'encrypt_pass', None)
-image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
+image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif']
+image_keys = ['Encrypt', 'EncryptPwdSha']
 
-class EncryptedImage(PILImage.Image):
-    __name__ = "EncryptedImage"
-
-    @staticmethod
-    def from_image(image: PILImage.Image):
-        image = image.copy()
-        img = EncryptedImage()
-        img.im = image.im
-        img._mode = image.mode
-        if image.im.mode:
-            try:
-                img.mode = image.im.mode
-            except Exception:
-                pass
-
-        img._size = image.size
-        img.format = image.format
-        if image.mode in ("P", "PA"):
-            img.palette = image.palette.copy() if image.palette else ImagePalette.ImagePalette()
-
-        img.info = image.info.copy()
-        return img
-
-    def save(self, fp, format=None, **params):
-        filename = ""
-        encryption_type = self.info.get('Encrypt')
-
-        if isinstance(fp, Path):
-            filename = str(fp)
-        elif _util.is_path(fp):
-            filename = fp
-        elif fp == sys.stdout:
-            try:
-                fp = sys.stdout.buffer
-            except AttributeError:
-                pass
-
-        if not filename and hasattr(fp, "name") and _util.is_path(fp.name):
-            filename = fp.name
-
-        if not filename or not password:
-            super().save(fp, format=format, **params)
-            return
-
-        if encryption_type in {'pixel_shuffle', 'pixel_shuffle_2', 'pixel_shuffle_3'}:
-            super().save(fp, format=format, **params)
-            return
-
-        back_img = PILImage.new('RGBA', self.size)
-        back_img.paste(self)
-
-        self.paste(PILImage.fromarray(encrypt_image_v3(self, get_sha256(password))))
-        self.format = PngImagePlugin.PngImageFile.format
-        pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo())
-        if not pnginfo:
-            pnginfo = PngImagePlugin.PngInfo()
-
-        pnginfo.add_text('Encrypt', 'pixel_shuffle_3')
-        pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(password)}Encrypt'))
-
-        for key, value in self.info.items():
-            if value is not None:
-                if key == 'icc_profile':
-                    continue
-                if isinstance(value, bytes):
-                    try:
-                        pnginfo.add_text(key, value.decode('utf-8'))
-                    except UnicodeDecodeError:
-                        try:
-                            pnginfo.add_text(key, value.decode('utf-16'))
-                        except UnicodeDecodeError:
-                            pnginfo.add_text(key, value.decode('utf-8', errors='replace'))
-                            print(f"Error decoding '{key}' for file '{filename}' in saving image.")
-                else:
-                    pnginfo.add_text(key, str(value))
-
-        params.update(pnginfo=pnginfo)
-        super().save(fp, format=self.format, **params)
-        #print(f"Encrypting: {filename}")
-        self.paste(back_img)
+def set_shared_options():
+    section = ("encrypt_image_is_enable", "Encrypt image")
+    option = shared.OptionInfo(default="Yes", label="Whether the encryption plug-in is enabled", section=section)
+    option.do_not_save = True
+    shared.opts.add_option("encrypt_image_is_enable", option)
+    shared.opts.data['encrypt_image_is_enable'] = "Yes"
 
 def hook_http_request(app: FastAPI):
     @app.middleware("http")
     async def image_decrypting(req: Request, call_next):
-        endpoint: str = req.scope.get('path', 'err')
-        endpoint = '/' + endpoint.strip('/')
+        endpoint = '/' + req.scope.get('path', 'err').strip('/')
 
-        if endpoint.startswith('/infinite_image_browsing/image-thumbnail') or endpoint.startswith('/infinite_image_browsing/file'):
-            query_string: str = req.scope.get('query_string').decode('utf-8')
-            query_string = unquote(query_string)
-            if query_string and query_string.index('path=') >= 0:
-                query = query_string.split('&')
-                path = ''
-                for sub in query:
-                    if sub.startswith('path='):
-                        path = sub[sub.index('=') + 1:]
-                if path:
-                    endpoint = '/file=' + path
+        def process_query(endpoint, prefixes, param):
+            if endpoint.startswith(prefixes):
+                query_string = unquote(req.scope.get('query_string', b'').decode('utf-8'))
+                return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(param)), '')
+            return None
 
-        if endpoint.startswith('/sd_extra_networks/thumb'):
-            query_string: str = req.scope.get('query_string').decode('utf-8')
-            query_string = unquote(query_string)
-            if query_string and query_string.index('filename=') >= 0:
-                query = query_string.split('&')
-                path = ''
-                for sub in query:
-                    if sub.startswith('filename='):
-                        path = sub[sub.index('=') + 1:]
-                if path:
-                    endpoint = '/file=' + path
+        path = process_query(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
+        if path:
+            endpoint = f'/file={path}'
+
+        filename = process_query(endpoint, '/sd_extra_networks/thumb', 'filename=')
+        if filename:
+            endpoint = f'/file={filename}'
 
         if endpoint.startswith('/file='):
             file_path = Path(endpoint[6:])
@@ -146,133 +69,151 @@ def hook_http_request(app: FastAPI):
                 image = PILImage.open(file_path)
                 pnginfo = image.info or {}
 
-                if 'Encrypt' not in pnginfo or 'EncryptPwdSha' not in pnginfo:
+                if not all(k in pnginfo for k in image_keys):
                     EncryptedImage.from_image(image).save(file_path)
                     image = PILImage.open(file_path)
                     pnginfo = image.info or {}
 
-                buffered = BytesIO()
+                buffered = io.BytesIO()
                 info = PngImagePlugin.PngInfo()
 
                 for key, value in pnginfo.items():
-                    if value is not None:
-                        if key == 'icc_profile':
-                            continue
-                        if isinstance(value, bytes):
+                    if value is None or key == 'icc_profile':
+                        continue
+                    if isinstance(value, bytes):
+                        try:
+                            info.add_text(key, value.decode('utf-8'))
+                        except UnicodeDecodeError:
                             try:
-                                info.add_text(key, value.decode('utf-8'))
+                                info.add_text(key, value.decode('utf-16'))
                             except UnicodeDecodeError:
-                                try:
-                                    info.add_text(key, value.decode('utf-16'))
-                                except UnicodeDecodeError:
-                                    info.add_text(key, str(value))
-                                    print(f"Error decoding '{key}' in hook http. {file_path}")
-                        else:
-                            info.add_text(key, str(value))
+                                info.add_text(key, str(value))
+                                print(f"Error decoding '{key}' in hook http. {file_path}")
+                    else:
+                        info.add_text(key, str(value))
 
                 image.save(buffered, format=PngImagePlugin.PngImageFile.format, pnginfo=info)
-                image_data = buffered.getvalue()
-                response = Response(content=image_data, media_type="image/png")
-                return response
+                return Response(content=buffered.getvalue(), media_type="image/png")
 
         return await call_next(req)
 
-def set_shared_options():
-    section = ("encrypt_image_is_enable", "Encrypt image")
-    option = shared.OptionInfo(default="Yes", label="Whether the encryption plug-in is enabled", section=section)
-    option.do_not_save = True
-    shared.opts.add_option("encrypt_image_is_enable", option)
-    shared.opts.data['encrypt_image_is_enable'] = "Yes"
+def WatchDogs(paths, extensions):
+    OBS = Observer()
+    file_queue = Queue(maxsize=1000)
+    processed_files = set()
+    lock = threading.Lock()
+    shutdown_event = threading.Event()
 
-def encrypt_in_dir(folder: str):
-    if not folder:
-        return
+    num_cpus = os.cpu_count()
+    thread_pool = ThreadPoolExecutor(max_workers=num_cpus * 4)
 
-    folder_path = Path(folder).resolve()
-    if not folder_path.is_dir():
-        return
+    def process_queue():
+        futures = []
+        while not shutdown_event.is_set():
+            try:
+                fp = file_queue.get(timeout=0.1)
+                if fp:
+                    future = thread_pool.submit(process_file, fp)
+                    futures.append(future)
 
-    def process_image(file_path: Path):
-        img = PILImage.open(file_path)
-        pnginfo = img.info or {}
+                    futures = [f for f in futures if not f.done()]
+                file_queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                print(f"Error: {e}")
 
-        if 'Encrypt' not in pnginfo or 'EncryptPwdSha' not in pnginfo:
-            EncryptedImage.from_image(img).save(file_path)
+    def process_file(fp):
+        with lock:
+            if fp in processed_files:
+                return
+            processed_files.add(fp)
 
-    for file_path in folder_path.rglob('*'):
-        if file_path.is_file() and file_path.suffix.lower() in image_extensions:
-            process_image(file_path)
+        try:
+            img = PILImage.open(fp)
+            pnginfo = img.info or {}
 
-    for subdir in folder_path.iterdir():
-        if subdir.is_dir():
-            actual_path = subdir.resolve()
+            if not all(k in pnginfo for k in image_keys):
+                print(f"{AR} {fp}")
+                EncryptedImage.from_image(img).save(fp)
 
-            for file_path in actual_path.rglob('*'):
-                if file_path.is_file() and file_path.suffix.lower() in image_extensions:
-                    process_image(file_path)
+        except Exception as e:
+            print(f"Error {fp}: {e}")
+            with lock:
+                processed_files.discard(fp)
 
-def encode_pil_to_base64(img: PILImage.Image):
-    pnginfo = img.info or {}
+    class OBSHandler(FileSystemEventHandler):
+        def __init__(self):
+            super().__init__()
+            self.event_buffer = {}
+            self.last_processed = time.time()
+            self.buffer_lock = threading.Lock()
 
-    with io.BytesIO() as output_bytes:
-        if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_3':
-            img.paste(PILImage.fromarray(decrypt_image_v3(img, get_sha256(password))))
-        elif 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_2':
-            decrypt_image_v2(img, get_sha256(password))
-        elif 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle':
-            decrypt_image(img, get_sha256(password))
+        def on_any_event(self, event):
+            if event.is_directory:
+                return
 
-        pnginfo["Encrypt"] = None
-        img.save(output_bytes, format=PngImagePlugin.PngImageFile.format, quality=opts.jpeg_quality)
-        bytes_data = output_bytes.getvalue()
+            fp = Path(event.src_path)
+            if fp.suffix.lower() not in extensions:
+                return
 
-    return base64.b64encode(bytes_data)
+            if event.event_type in ('created', 'modified', 'moved'):
+                with self.buffer_lock:
+                    self.event_buffer[fp] = time.time()
 
-def open(fp, *args, **kwargs):
-    if not _util.is_path(fp) or not Path(fp).suffix:
-        return super_open(fp, *args, **kwargs)
+                current_time = time.time()
+                if current_time - self.last_processed > 0.1:
+                    self._process_buffer()
 
-    if isinstance(fp, bytes):
-        return encode_pil_to_base64(fp)
+        def _process_buffer(self):
+            with self.buffer_lock:
+                current_time = time.time()
+                files_to_process = []
 
-    img = super_open(fp, *args, **kwargs)
-    pnginfo = img.info or {}
+                for fp, timestamp in list(self.event_buffer.items()):
+                    if current_time - timestamp >= 0.1 and fp.exists():
+                        files_to_process.append(fp)
+                        del self.event_buffer[fp]
 
-    if password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
-        if 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_3':
-            img.paste(PILImage.fromarray(decrypt_image_v3(img, get_sha256(password))))
-        elif 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle_2':
-            decrypt_image_v2(img, get_sha256(password))
-        elif 'Encrypt' in pnginfo and pnginfo["Encrypt"] == 'pixel_shuffle':
-            decrypt_image(img, get_sha256(password))
+                for fp in files_to_process:
+                    file_queue.put(fp)
 
-        pnginfo["Encrypt"] = None
-        img = EncryptedImage.from_image(img)
-        return img
+                self.last_processed = current_time
 
-    return EncryptedImage.from_image(img)
+    num_workers = num_cpus * 4
+    workers = []
+    for _ in range(num_workers):
+        worker = threading.Thread(target=process_queue, daemon=True)
+        worker.start()
+        workers.append(worker)
+
+    handler = OBSHandler()
+    for path in paths:
+        OBS.schedule(handler, path, recursive=True)
+
+    OBS.start()
+
+    try:
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+        shutdown_event.set()
+        OBS.stop()
+        OBS.join()
+
+        file_queue.join()
+        thread_pool.shutdown()
+
+        for worker in workers:
+            worker.join(timeout=1)
 
 def app_started_callback(_: gr.Blocks, app: FastAPI):
     app.middleware_stack = None
     set_shared_options()
     hook_http_request(app)
-
-    encrypt_in_dir(ckpt_dir)
-    encrypt_in_dir(lora_dir)
-    encrypt_in_dir(emb_dir)
-    encrypt_in_dir(vae_dir)
-
+    WatchDogs([models, emb_dir], set(image_extensions))
     app.build_middleware_stack()
-
-if password == '':
-    msg = f'{AR} {TITLE} {RED}Disabled{RST}, --encrypt-pass value is empty.'
-elif not password:
-    msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
-else:
-    script_callbacks.on_app_started(app_started_callback)
-    msg = f'{AR} {TITLE} {BLUE}Enabled{RST}, Encryption {ORG}3{RST}'
-
-print(msg)
 
 if PILImage.Image.__name__ != 'EncryptedImage':
     super_open = PILImage.open
@@ -280,7 +221,133 @@ if PILImage.Image.__name__ != 'EncryptedImage':
     super_modules_images_save_image = images.save_image
     super_api_middleware = api.api_middleware
 
+    class EncryptedImage(PILImage.Image):
+        __name__ = "EncryptedImage"
+
+        @staticmethod
+        def from_image(image: PILImage.Image):
+            image = image.copy()
+            img = EncryptedImage()
+            img.im = image.im
+            img._mode = image.mode
+            if image.im.mode:
+                try:
+                    img.mode = image.im.mode
+                except Exception:
+                    pass
+
+            img._size = image.size
+            img.format = image.format
+            if image.mode in ("P", "PA"):
+                img.palette = image.palette.copy() if image.palette else ImagePalette.ImagePalette()
+
+            img.info = image.info.copy()
+            return img
+
+        def save(self, fp, format=None, **params):
+            filename = ""
+            encryption_type = self.info.get('Encrypt')
+
+            if isinstance(fp, Path):
+                filename = str(fp)
+            elif _util.is_path(fp):
+                filename = fp
+            elif fp == sys.stdout:
+                try:
+                    fp = sys.stdout.buffer
+                except AttributeError:
+                    pass
+
+            if not filename and hasattr(fp, "name") and _util.is_path(fp.name):
+                filename = fp.name
+
+            if not filename or not password:
+                super().save(fp, format=format, **params)
+                return
+
+            if encryption_type == 'pixel_shuffle_3':
+                super().save(fp, format=format, **params)
+                return
+
+            back_img = PILImage.new('RGBA', self.size)
+            back_img.paste(self)
+
+            try:
+                encrypted_img = PILImage.fromarray(encrypt_image_v3(self, get_sha256(password)))
+                self.paste(encrypted_img)
+                encrypted_img.close()
+            except Exception as e:
+                if "axes don't match array" in str(e):
+                    fn = Path(filename)
+                    os.system(f'rm -f {fn}')
+                    return
+
+            self.format = PngImagePlugin.PngImageFile.format
+            pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo())
+            if not pnginfo:
+                pnginfo = PngImagePlugin.PngInfo()
+                for key in (self.info or {}).keys():
+                    if self.info[key]:
+                        print(f'{key}:{str(self.info[key])}')
+                        pnginfo.add_text(key,str(self.info[key]))
+
+            pnginfo.add_text('Encrypt', 'pixel_shuffle_3')
+            pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(password)}Encrypt'))
+
+            params.update(pnginfo=pnginfo)
+            super().save(fp, format=self.format, **params)
+            self.paste(back_img)
+            back_img.close()
+
+    def open(fp, *args, **kwargs):
+        if not _util.is_path(fp) or not Path(fp).suffix:
+            return super_open(fp, *args, **kwargs)
+
+        if isinstance(fp, bytes):
+            return encode_pil_to_base64(fp)
+
+        img = super_open(fp, *args, **kwargs)
+        try:
+            pnginfo = img.info or {}
+
+            if password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
+                if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
+                    decrypted_img = PILImage.fromarray(decrypt_image_v3(img, get_sha256(password)))
+                    img.paste(decrypted_img)
+                    decrypted_img.close()
+                    pnginfo["Encrypt"] = None
+                    
+            return EncryptedImage.from_image(img)
+        finally:
+            img.close()
+
+    def encode_pil_to_base64(img: PILImage.Image):
+        pnginfo = img.info or {}
+
+        with io.BytesIO() as output_bytes:
+            if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
+                img.paste(PILImage.fromarray(decrypt_image_v3(img, get_sha256(password))))
+
+            pnginfo["Encrypt"] = None
+            img.save(output_bytes, format=PngImagePlugin.PngImageFile.format, quality=shared.opts.jpeg_quality)
+            bytes_data = output_bytes.getvalue()
+
+        return base64.b64encode(bytes_data)
+
     if password:
         PILImage.Image = EncryptedImage
         PILImage.open = open
         api.encode_pil_to_base64 = encode_pil_to_base64
+
+
+if password == '':
+    msg = f'{AR} {TITLE} {RED}Disabled{RST}, --encrypt-pass value is empty.'
+elif not password:
+    msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
+else:
+    script_callbacks.on_app_started(app_started_callback)
+    msg = f'{AR} {TITLE} {BLUE}Enabled{RST}, Encryption Level {ORG}4{RST}' \
+          f'\n{AR} {TITLE} Check the release page for decrypting images in local Windows ' \
+          f'https://github.com/gutris1/sd-encrypt-image'
+
+print(msg)
