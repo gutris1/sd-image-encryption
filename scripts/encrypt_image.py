@@ -346,6 +346,8 @@ elif not password:
     msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
 else:
     script_callbacks.on_app_started(app_started_callback)
-    msg = f'{AR} {TITLE} {BLUE}Enabled{RST}, Encryption Level {ORG}4{RST}'
+    msg = f'{AR} {TITLE} {BLUE}Enabled{RST}, Encryption Level {ORG}4{RST}' \
+          f'\n{AR} {TITLE} Check the release page for decrypting images in local Windows ' \
+          f'https://github.com/gutris1/sd-encrypt-image'
 
 print(msg)
