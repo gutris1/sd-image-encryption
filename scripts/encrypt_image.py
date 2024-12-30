@@ -103,9 +103,24 @@ def WatchDogs(paths, extensions):
     processed_files = set()
     lock = threading.Lock()
     shutdown_event = threading.Event()
-
     num_cpus = os.cpu_count()
     thread_pool = ThreadPoolExecutor(max_workers=num_cpus * 4)
+
+    def main_loop():
+        try:
+            while not shutdown_event.is_set():
+                if os.environ.get('SD_WEBUI_RESTARTING') == '1':
+                    shutdown_event.set()
+                    OBS.stop()
+                    OBS.join()
+                    file_queue.join()
+                    thread_pool.shutdown()
+                    for worker in workers:
+                        worker.join(timeout=1)
+                    break
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            shutdown_event.set()
 
     def process_queue():
         futures = []
@@ -115,7 +130,6 @@ def WatchDogs(paths, extensions):
                 if fp:
                     future = thread_pool.submit(process_file, fp)
                     futures.append(future)
-
                     futures = [f for f in futures if not f.done()]
                 file_queue.task_done()
             except Empty:
@@ -128,15 +142,12 @@ def WatchDogs(paths, extensions):
             if fp in processed_files:
                 return
             processed_files.add(fp)
-
         try:
             img = PILImage.open(fp)
             pnginfo = img.info or {}
-
             if not all(k in pnginfo for k in image_keys):
                 print(f"{AR} {fp}")
                 EncryptedImage.from_image(img).save(fp)
-
         except Exception as e:
             print(f"Error {fp}: {e}")
             with lock:
@@ -152,15 +163,12 @@ def WatchDogs(paths, extensions):
         def on_any_event(self, event):
             if event.is_directory:
                 return
-
             fp = Path(event.src_path)
             if fp.suffix.lower() not in extensions:
                 return
-
             if event.event_type in ('created', 'modified', 'moved'):
                 with self.buffer_lock:
                     self.event_buffer[fp] = time.time()
-
                 current_time = time.time()
                 if current_time - self.last_processed > 0.1:
                     self._process_buffer()
@@ -169,15 +177,12 @@ def WatchDogs(paths, extensions):
             with self.buffer_lock:
                 current_time = time.time()
                 files_to_process = []
-
                 for fp, timestamp in list(self.event_buffer.items()):
                     if current_time - timestamp >= 0.1 and fp.exists():
                         files_to_process.append(fp)
                         del self.event_buffer[fp]
-
                 for fp in files_to_process:
                     file_queue.put(fp)
-
                 self.last_processed = current_time
 
     num_workers = num_cpus * 4
@@ -190,23 +195,10 @@ def WatchDogs(paths, extensions):
     handler = OBSHandler()
     for path in paths:
         OBS.schedule(handler, path, recursive=True)
-
     OBS.start()
 
-    try:
-        while True:
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("Shutting down...")
-        shutdown_event.set()
-        OBS.stop()
-        OBS.join()
-
-        file_queue.join()
-        thread_pool.shutdown()
-
-        for worker in workers:
-            worker.join(timeout=1)
+    main_thread = threading.Thread(target=main_loop, daemon=True)
+    main_thread.start()
 
 def app_started_callback(_: gr.Blocks, app: FastAPI):
     app.middleware_stack = None
