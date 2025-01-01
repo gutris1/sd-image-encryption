@@ -111,12 +111,10 @@ def WatchDogs(paths, extensions):
             while not shutdown_event.is_set():
                 if os.environ.get('SD_WEBUI_RESTARTING') == '1':
                     shutdown_event.set()
+                    if lock.locked():
+                        lock.release()
                     OBS.stop()
-                    OBS.join()
-                    file_queue.join()
-                    thread_pool.shutdown()
-                    for worker in workers:
-                        worker.join(timeout=1)
+                    thread_pool.shutdown(wait=False)
                     break
                 time.sleep(0.1)
         except KeyboardInterrupt:
