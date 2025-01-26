@@ -34,51 +34,74 @@ Embed  = shared.cmd_opts.embeddings_dir
 Models = Path(models_path)
 
 password = getattr(shared.cmd_opts, 'encrypt_pass', None)
-image_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif']
+image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
 image_keys = ['Encrypt', 'EncryptPwdSha']
+tag_list = ['parameters', 'UserComment']
 
-def set_shared_options():
+def SetSharedOptions():
     section = ("encrypt_image_is_enable", "Encrypt image")
     option = shared.OptionInfo(default="Yes", label="Whether the encryption plug-in is enabled", section=section)
     option.do_not_save = True
     shared.opts.add_option("encrypt_image_is_enable", option)
     shared.opts.data['encrypt_image_is_enable'] = "Yes"
 
-def get_range(input: str, offset: int, range_len=4):
+def GetRange(input: str, offset: int, range_len=4):
     offset = offset % len(input)
     return (input * 2)[offset:offset + range_len]
 
-def get_sha256(input: str):
+def GetSHA256(input: str):
     return hashlib.sha256(input.encode('utf-8')).hexdigest()
 
-def shuffle_arr_v2(arr, key):
-    sha_key = get_sha256(key)
+def ShuffleArray(arr, key):
+    sha_key = GetSHA256(key)
     arr_len = len(arr)
-
     for i in range(arr_len):
         s_idx = arr_len - i - 1
-        to_index = int(get_range(sha_key, i, range_len=8), 16) % (arr_len - i)
+        to_index = int(GetRange(sha_key, i, range_len=8), 16) % (arr_len - i)
         arr[s_idx], arr[to_index] = arr[to_index], arr[s_idx]
-
     return arr
 
-def encrypt_image_v3(image: Image.Image, psw):
+def EncryptTags(m, p):
+    t = m.copy()
+    for k in tag_list:
+        if k in m:
+            v = str(m[k])
+            ev = base64.b64encode(
+                ''.join(chr(ord(c) ^ ord(p[i % len(p)])) for i, c in enumerate(v)).encode('utf-8')
+            ).decode('utf-8')
+            t[k] = f"OPPAI:{ev}"
+    return t
+
+def DecryptTags(m, p):
+    t = m.copy()
+    for k in tag_list:
+        if k in m and str(m[k]).startswith("OPPAI:"):
+            v = m[k][len("OPPAI:"):]
+            try:
+                d = base64.b64decode(v).decode('utf-8')
+                dv = ''.join(chr(ord(c) ^ ord(p[i % len(p)])) for i, c in enumerate(d))
+                t[k] = dv
+            except Exception:
+                t[k] = m[k]
+    return t
+
+def EncryptImage(image: Image.Image, psw):
     try:
         width = image.width
         height = image.height
         x_arr = np.arange(width)
-        shuffle_arr_v2(x_arr,psw) 
+        ShuffleArray(x_arr, psw)
         y_arr = np.arange(height)
-        shuffle_arr_v2(y_arr,get_sha256(psw))
+        ShuffleArray(y_arr, GetSHA256(psw))
         pixel_array = np.array(image)
 
         _pixel_array = pixel_array.copy()
-        for x in range(height): 
+        for x in range(height):
             pixel_array[x] = _pixel_array[y_arr[x]]
         pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
 
         _pixel_array = pixel_array.copy()
-        for x in range(width): 
+        for x in range(width):
             pixel_array[x] = _pixel_array[x_arr[x]]
         pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
 
@@ -87,23 +110,23 @@ def encrypt_image_v3(image: Image.Image, psw):
         if "axes don't match array" in str(e):
             return np.array(image)
 
-def decrypt_image_v3(image: Image.Image, psw):
+def DecryptImage(image: Image.Image, psw):
     try:
         width = image.width
         height = image.height
         x_arr = np.arange(width)
-        shuffle_arr_v2(x_arr, psw)
+        ShuffleArray(x_arr, psw)
         y_arr = np.arange(height)
-        shuffle_arr_v2(y_arr, get_sha256(psw))
+        ShuffleArray(y_arr, GetSHA256(psw))
         pixel_array = np.array(image)
 
         _pixel_array = pixel_array.copy()
-        for x in range(height): 
+        for x in range(height):
             pixel_array[y_arr[x]] = _pixel_array[x]
         pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
 
         _pixel_array = pixel_array.copy()
-        for x in range(width): 
+        for x in range(width):
             pixel_array[x_arr[x]] = _pixel_array[x]
         pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
 
@@ -138,7 +161,6 @@ class EncryptedImage(PILImage.Image):
 
     def save(self, fp, format=None, **params):
         filename = ""
-        encryption_type = self.info.get('Encrypt')
 
         if isinstance(fp, Path):
             filename = str(fp)
@@ -157,15 +179,18 @@ class EncryptedImage(PILImage.Image):
             super().save(fp, format=format, **params)
             return
 
-        if encryption_type == 'pixel_shuffle_3':
+        if self.info.get('Encrypt') == 'pixel_shuffle_3':
             super().save(fp, format=format, **params)
             return
+
+        encrypted_info = EncryptTags(self.info, password)
+        pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo()) or PngImagePlugin.PngInfo()
 
         back_img = PILImage.new('RGBA', self.size)
         back_img.paste(self)
 
         try:
-            encrypted_img = PILImage.fromarray(encrypt_image_v3(self, get_sha256(password)))
+            encrypted_img = PILImage.fromarray(EncryptImage(self, GetSHA256(password)))
             self.paste(encrypted_img)
             encrypted_img.close()
         except Exception as e:
@@ -174,19 +199,15 @@ class EncryptedImage(PILImage.Image):
                 os.system(f'rm -f {fn}')
                 return
 
-        self.format = PngImagePlugin.PngImageFile.format
-        pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo())
-        if not pnginfo:
-            pnginfo = PngImagePlugin.PngInfo()
-            for key in (self.info or {}).keys():
-                if self.info[key]:
-                    print(f'{key}:{str(self.info[key])}')
-                    pnginfo.add_text(key,str(self.info[key]))
+        for key, value in encrypted_info.items():
+            if value:
+                pnginfo.add_text(key, str(value))
 
         pnginfo.add_text('Encrypt', 'pixel_shuffle_3')
-        pnginfo.add_text('EncryptPwdSha', get_sha256(f'{get_sha256(password)}Encrypt'))
+        pnginfo.add_text('EncryptPwdSha', GetSHA256(f'{GetSHA256(password)}Encrypt'))
 
         params.update(pnginfo=pnginfo)
+        self.format = PngImagePlugin.PngImageFile.format
         super().save(fp, format=self.format, **params)
         self.paste(back_img)
         back_img.close()
@@ -204,31 +225,35 @@ def open(fp, *args, **kwargs):
             pnginfo = img.info or {}
 
             if password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
+                pnginfo = DecryptTags(pnginfo, password)
+
                 if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
-                    decrypted_img = PILImage.fromarray(decrypt_image_v3(img, get_sha256(password)))
+                    decrypted_img = PILImage.fromarray(DecryptImage(img, GetSHA256(password)))
                     img.paste(decrypted_img)
                     decrypted_img.close()
                     pnginfo["Encrypt"] = None
 
+            img.info = pnginfo
             return EncryptedImage.from_image(img)
 
         except Exception as e:
-            print(f"Error in 146 : {fp} : {e}")
+            print(f"Error in 240 : {fp} : {e}")
             return None
 
         finally:
             img.close()
 
     except Exception as e:
-        print(f"Error in 153 : {fp} : {e}")
+        print(f"Error in 247 : {fp} : {e}")
         return None
 
 def encode_pil_to_base64(img: PILImage.Image):
     pnginfo = img.info or {}
 
     with io.BytesIO() as output_bytes:
+        pnginfo = DecryptTags(pnginfo, password)
         if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
-            img.paste(PILImage.fromarray(decrypt_image_v3(img, get_sha256(password))))
+            img.paste(PILImage.fromarray(DecryptImage(img, GetSHA256(password))))
 
         pnginfo["Encrypt"] = None
         img.save(output_bytes, format=PngImagePlugin.PngImageFile.format, quality=shared.opts.jpeg_quality)
@@ -249,7 +274,7 @@ def imgResize(image, target_height=500):
         return image.resize((new_width, target_height), PILImage.Resampling.LANCZOS)
     return image
 
-async def imgAsync(fp, image_keys, should_resize=False):
+async def imgAsync(fp, should_resize=False):
     loop = asyncio.get_running_loop()
     if loop not in _semaphores:
         _semaphores[loop] = _semaphore_factory()
@@ -263,27 +288,27 @@ async def imgAsync(fp, image_keys, should_resize=False):
             try:
                 content = await loop.run_in_executor(
                     _executor,
-                    lambda: imgProcess(fp, image_keys, should_resize)
+                    lambda: imgProcess(fp, should_resize)
                 )
             except Exception as e:
-                print(f"Error in 256 : {fp}, Error: {e}")
+                print(f"Error in 294 : {fp}, Error: {e}")
                 return None
 
             p_cache[fp] = content
             return content
     except Exception as e:
-        print(f"Error in 262 : {fp}: {e}")
+        print(f"Error in 300 : {fp}: {e}")
         try:
             with open(fp, 'rb') as f:
                 return f.read()
         except Exception as inner_e:
-            print(f"Error in 267 : {inner_e}")
+            print(f"Error in 305 : {inner_e}")
             return None
     finally:
         if fp in p_cache:
             del p_cache[fp]
 
-def imgProcess(fp, image_keys, should_resize):
+def imgProcess(fp, should_resize):
     try:
         with PILImage.open(fp) as image:
             try:
@@ -304,7 +329,7 @@ def imgProcess(fp, image_keys, should_resize):
                     image = PILImage.open(fp)
                     pnginfo = image.info or {}
                 except Exception as e:
-                    print(f"Error in 294 : {fp}: {e}")
+                    print(f"Error in 332 : {fp}: {e}")
                     return None
 
             buffered = io.BytesIO()
@@ -329,10 +354,11 @@ def imgProcess(fp, image_keys, should_resize):
             image.close()
             return buffered.getvalue()
     except Exception as e:
-        print(f"Error in 319 : {fp}: {e}")
+        print(f"Error in 357 : {fp}: {e}")
         return None
 
 def hook_http_request(app: FastAPI):
+
     @app.middleware("http")
     async def image_decrypting(req: Request, call_next):
         endpoint = '/' + req.scope.get('path', 'err').strip('/')
@@ -360,7 +386,7 @@ def hook_http_request(app: FastAPI):
 
             if ext in image_extensions:
                 should_resize = str(Models) in str(fp) or str(Embed) in str(fp)
-                content = await imgAsync(fp, image_keys, should_resize)
+                content = await imgAsync(fp, should_resize)
                 if content:
                     return Response(content=content, media_type="image/png")
                 return await call_next(req)
@@ -389,7 +415,7 @@ def WatchDogs(paths, extensions):
             except Empty:
                 continue
             except Exception as e:
-                print(f"Error in 303 : {e}")
+                print(f"Error in 418 : {e}")
 
     def process_file(fp):
         with lock:
@@ -403,7 +429,7 @@ def WatchDogs(paths, extensions):
                 print(f"{AR} {fp}")
                 EncryptedImage.from_image(img).save(fp)
         except Exception as e:
-            print(f"Error in 317 : {fp} : {e}")
+            print(f"Error in 432 : {fp} : {e}")
             with lock:
                 processed_files.discard(fp)
 
@@ -451,9 +477,9 @@ def WatchDogs(paths, extensions):
         OBS.schedule(handler, path, recursive=True)
     OBS.start()
 
-def app_started_callback(_: gr.Blocks, app: FastAPI):
+def image_encryption_started(_: gr.Blocks, app: FastAPI):
     app.middleware_stack = None
-    set_shared_options()
+    SetSharedOptions()
     hook_http_request(app)
     app.build_middleware_stack()
 
@@ -476,8 +502,8 @@ if password == '':
 elif not password:
     msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
 else:
-    script_callbacks.on_app_started(app_started_callback)
-    msg = f'{AR} {TITLE} {BLUE}Enabled{RST}' \
+    script_callbacks.on_app_started(image_encryption_started)
+    msg = f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v4{RST}' \
           f'\n{AR} {TITLE} Check the release page for decrypting images in local Windows ' \
           f'https://github.com/gutris1/sd-encrypt-image'
 
