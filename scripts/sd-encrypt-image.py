@@ -23,6 +23,12 @@ from modules import shared, script_callbacks, images
 from modules.paths_internal import models_path
 from modules.api import api
 
+try:
+    from modules_forge.forge_canvas.canvas import ForgeCanvas
+    Forge = True
+except ModuleNotFoundError:
+    Forge = False
+
 RST = '\033[0m'
 ORG = '\033[38;5;208m'
 AR = f'{ORG}▶{RST}'
@@ -237,14 +243,14 @@ def open(fp, *args, **kwargs):
             return EncryptedImage.from_image(img)
 
         except Exception as e:
-            print(f"Error in 240 : {fp} : {e}")
+            print(f"Error in 246 : {fp} : {e}")
             return None
 
         finally:
             img.close()
 
     except Exception as e:
-        print(f"Error in 247 : {fp} : {e}")
+        print(f"Error in 253 : {fp} : {e}")
         return None
 
 def encode_pil_to_base64(img: PILImage.Image):
@@ -291,18 +297,18 @@ async def imgAsync(fp, should_resize=False):
                     lambda: imgProcess(fp, should_resize)
                 )
             except Exception as e:
-                print(f"Error in 294 : {fp}, Error: {e}")
+                print(f"Error in 300 : {fp}, Error: {e}")
                 return None
 
             p_cache[fp] = content
             return content
     except Exception as e:
-        print(f"Error in 300 : {fp}: {e}")
+        print(f"Error in 306 : {fp}: {e}")
         try:
             with open(fp, 'rb') as f:
                 return f.read()
         except Exception as inner_e:
-            print(f"Error in 305 : {inner_e}")
+            print(f"Error in 311 : {inner_e}")
             return None
     finally:
         if fp in p_cache:
@@ -329,7 +335,7 @@ def imgProcess(fp, should_resize):
                     image = PILImage.open(fp)
                     pnginfo = image.info or {}
                 except Exception as e:
-                    print(f"Error in 332 : {fp}: {e}")
+                    print(f"Error in 338 : {fp}: {e}")
                     return None
 
             buffered = io.BytesIO()
@@ -354,49 +360,8 @@ def imgProcess(fp, should_resize):
             image.close()
             return buffered.getvalue()
     except Exception as e:
-        print(f"Error in 357 : {fp}: {e}")
+        print(f"Error in 363 : {fp}: {e}")
         return None
-
-def hook_http_request(app: FastAPI):
-
-    @app.middleware("http")
-    async def image_decrypting(req: Request, call_next):
-        endpoint = '/' + req.scope.get('path', 'err').strip('/')
-
-        def process_query(endpoint, prefixes, param):
-            if endpoint.startswith(prefixes):
-                query_string = unquote(req.scope.get('query_string', b'').decode('utf-8'))
-                return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(param)), '')
-            return None
-
-        if endpoint.startswith('/sd-hub-gallery/image'):
-            img_path = endpoint[len('/sd-hub-gallery/image'):]
-            if img_path:
-                endpoint = f'/file={img_path}'
-
-        path = process_query(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
-        if path:
-            endpoint = f'/file={path}'
-
-        fn = process_query(endpoint, '/sd_extra_networks/thumb', 'filename=')
-        if fn:
-            endpoint = f'/file={fn}'
-
-        if endpoint.startswith('/file='):
-            fp = Path(endpoint[6:])
-            ext = fp.suffix.lower().split('?')[0]
-
-            if 'card-no-preview.png' in str(fp):
-                return await call_next(req)
-
-            if ext in image_extensions:
-                should_resize = str(Models) in str(fp) or str(Embed) in str(fp)
-                content = await imgAsync(fp, should_resize)
-                if content:
-                    return Response(content=content, media_type="image/png")
-                return await call_next(req)
-
-        return await call_next(req)
 
 def WatchDogs(paths, extensions):
     OBS = Observer()
@@ -420,7 +385,7 @@ def WatchDogs(paths, extensions):
             except Empty:
                 continue
             except Exception as e:
-                print(f"Error in 418 : {e}")
+                print(f"Error in 388 : {e}")
 
     def process_file(fp):
         with lock:
@@ -434,7 +399,7 @@ def WatchDogs(paths, extensions):
                 print(f"{AR} {fp}")
                 EncryptedImage.from_image(img).save(fp)
         except Exception as e:
-            print(f"Error in 432 : {fp} : {e}")
+            print(f"Error in 402 : {fp} : {e}")
             with lock:
                 processed_files.discard(fp)
 
@@ -482,11 +447,106 @@ def WatchDogs(paths, extensions):
         OBS.schedule(handler, path, recursive=True)
     OBS.start()
 
+async def img_req(endpoint, query, full_path, res):
+    if endpoint.startswith('/sd-hub-gallery/image'):
+        img_path = endpoint[len('/sd-hub-gallery/image'):]
+        if img_path:
+            endpoint = f'/file={img_path}'
+
+    def process_query(endpoint_path, prefixes, param):
+        if endpoint_path.startswith(prefixes):
+            query_string = unquote(query())
+            return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(param)), '')
+        return None
+
+    path = process_query(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
+    if path:
+        endpoint = f'/file={path}'
+
+    fn = process_query(endpoint, '/sd_extra_networks/thumb', 'filename=')
+    if fn:
+        endpoint = f'/file={fn}'
+
+    if endpoint.startswith('/file='):
+        fp = full_path(endpoint[6:])
+        ext = fp.suffix.lower().split('?')[0]
+
+        if 'card-no-preview.png' in str(fp):
+            return False, None
+
+        if ext in image_extensions:
+            should_resize = str(Models) in str(fp) or str(Embed) in str(fp)
+            content = await imgAsync(fp, should_resize)
+            if content:
+                return True, res(content)
+
+    return False, None
+
+def hook_http_request(app: FastAPI):
+    @app.middleware("http")
+    async def image_decrypting(req: Request, call_next):
+        endpoint = '/' + req.scope.get('path', 'err').strip('/')
+
+        def query():
+            return req.scope.get('query_string', b'').decode('utf-8')
+
+        def res(content):
+            return Response(content=content, media_type="image/png")
+
+        lines, response = await img_req(
+            endpoint=endpoint,
+            query=query,
+            full_path=Path,
+            res=res
+        )
+
+        if lines:
+            return response
+
+        return await call_next(req)
+
+def hook_forge_http_request(app):
+    import starlette.responses as ass
+    from starlette.types import ASGIApp, Receive, Scope, Send
+
+    class Reqs:
+        def __init__(self, app: ASGIApp):
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send):
+            if scope["type"] == "http":
+                endpoint = '/' + scope.get('path', 'err').strip('/')
+
+                def query():
+                    return scope.get('query_string', b'').decode('utf-8')
+
+                def res(content):
+                    return ass.Response(content=content, media_type="image/png")
+
+                lines, response = await img_req(
+                    endpoint=endpoint,
+                    query=query,
+                    full_path=Path,
+                    res=res
+                )
+
+                if lines:
+                    await response(scope, receive, send)
+                    return
+
+            await self.app(scope, receive, send)
+
+    app.middleware_stack = Reqs(app.middleware_stack)
+
 def image_encryption_started(_: gr.Blocks, app: FastAPI):
-    app.middleware_stack = None
     SetSharedOptions()
-    hook_http_request(app)
-    app.build_middleware_stack()
+
+    if not Forge:
+        app.middleware_stack = None
+        hook_http_request(app)
+        app.build_middleware_stack()
+    else:
+        hook_forge_http_request(app)
 
 if PILImage.Image.__name__ != 'EncryptedImage':
     super_open = PILImage.open
@@ -508,7 +568,7 @@ elif not password:
     msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
 else:
     script_callbacks.on_app_started(image_encryption_started)
-    msg = f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v4{RST}' \
+    msg = f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v5{RST}' \
           f'\n{AR} {TITLE} Check the release page for decrypting images in local Windows ' \
           f'https://github.com/gutris1/sd-encrypt-image'
 
