@@ -43,6 +43,7 @@ password = getattr(shared.cmd_opts, 'encrypt_pass', None)
 image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
 image_keys = ['Encrypt', 'EncryptPwdSha']
 tag_list = ['parameters', 'UserComment']
+headers = {"Cache-Control": "public, max-age=2592000"}
 
 def SetSharedOptions():
     section = ("encrypt_image_is_enable", "Encrypt image")
@@ -491,15 +492,9 @@ def hook_http_request(app: FastAPI):
             return req.scope.get('query_string', b'').decode('utf-8')
 
         def res(content):
-            return Response(content=content, media_type="image/png")
+            return Response(content=content, media_type='image/png', headers=headers)
 
-        lines, response = await img_req(
-            endpoint=endpoint,
-            query=query,
-            full_path=Path,
-            res=res
-        )
-
+        lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
         if lines:
             return response
 
@@ -521,15 +516,9 @@ def hook_forge_http_request(app):
                     return scope.get('query_string', b'').decode('utf-8')
 
                 def res(content):
-                    return ass.Response(content=content, media_type="image/png")
+                    return ass.Response(content=content, media_type='image/png', headers=headers)
 
-                lines, response = await img_req(
-                    endpoint=endpoint,
-                    query=query,
-                    full_path=Path,
-                    res=res
-                )
-
+                lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
                 if lines:
                     await response(scope, receive, send)
                     return
