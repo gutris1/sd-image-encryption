@@ -13,17 +13,9 @@ import sys
 import io
 import os
 
-from modules.script_callbacks import on_app_started
 from modules.paths_internal import models_path
 from modules import shared, images
 from modules.api import api
-
-RST = '\033[0m'
-ORG = '\033[38;5;208m'
-AR = f'{ORG}▶{RST}'
-BLUE = '\033[38;5;39m'
-RED = '\033[38;5;196m'
-TITLE = 'Image Encryption:'
 
 password = getattr(shared.cmd_opts, 'encrypt_pass', None)
 Embed = Path(shared.cmd_opts.embeddings_dir)
@@ -413,11 +405,3 @@ if PILImage.Image.__name__ != 'EncryptedImage':
         PILImage.Image = EncryptedImage
         PILImage.open = open
         api.encode_pil_to_base64 = encode_pil_to_base64
-
-if password == '':
-    print(f'{AR} {TITLE} {RED}Disabled{RST}, --encrypt-pass value is empty.')
-elif not password:
-    print(f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.')
-else:
-    print(f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v6{RST}\n{AR} {TITLE} Check the release page for decrypting images in local Windows https://github.com/gutris1/sd-encrypt-image')
-    on_app_started(App)
