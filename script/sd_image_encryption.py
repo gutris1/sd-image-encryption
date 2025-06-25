@@ -1,33 +1,22 @@
 from PIL import Image as PILImage, PngImagePlugin, _util, ImagePalette
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, Response
-from threading import Lock, Event, Thread
 from urllib.parse import unquote
-from queue import Queue, Empty
 from pathlib import Path
 from PIL import Image
 import gradio as gr
 import numpy as np
-import hashlib
 import asyncio
+import hashlib
 import base64
-import time
 import sys
 import io
 import os
 
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
-
-from modules import shared, script_callbacks, images
+from modules.script_callbacks import on_app_started
 from modules.paths_internal import models_path
+from modules import shared, images
 from modules.api import api
-
-try:
-    from modules_forge.forge_canvas.canvas import ForgeCanvas
-    Forge = True
-except ModuleNotFoundError:
-    Forge = False
 
 RST = '\033[0m'
 ORG = '\033[38;5;208m'
@@ -36,21 +25,15 @@ BLUE = '\033[38;5;39m'
 RED = '\033[38;5;196m'
 TITLE = 'Image Encryption:'
 
-Embed  = shared.cmd_opts.embeddings_dir
+password = getattr(shared.cmd_opts, 'encrypt_pass', None)
+Embed = Path(shared.cmd_opts.embeddings_dir)
 Models = Path(models_path)
 
-password = getattr(shared.cmd_opts, 'encrypt_pass', None)
-image_extensions = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
+image_exts = ['.png', '.jpg', '.jpeg', '.webp', '.avif']
 image_keys = ['Encrypt', 'EncryptPwdSha']
 tag_list = ['parameters', 'UserComment']
-headers = {"Cache-Control": "public, max-age=2592000"}
-
-def SetSharedOptions():
-    section = ("encrypt_image_is_enable", "Encrypt image")
-    option = shared.OptionInfo(default="Yes", label="Whether the encryption plug-in is enabled", section=section)
-    option.do_not_save = True
-    shared.opts.add_option("encrypt_image_is_enable", option)
-    shared.opts.data['encrypt_image_is_enable'] = "Yes"
+headers = {'Cache-Control': 'public, max-age=2592000'}
+mismatch = "axes don't match array"
 
 def GetRange(input: str, offset: int, range_len=4):
     offset = offset % len(input)
@@ -76,14 +59,14 @@ def EncryptTags(m, p):
             ev = base64.b64encode(
                 ''.join(chr(ord(c) ^ ord(p[i % len(p)])) for i, c in enumerate(v)).encode('utf-8')
             ).decode('utf-8')
-            t[k] = f"OPPAI:{ev}"
+            t[k] = f'OPPAI:{ev}'
     return t
 
 def DecryptTags(m, p):
     t = m.copy()
     for k in tag_list:
-        if k in m and str(m[k]).startswith("OPPAI:"):
-            v = m[k][len("OPPAI:"):]
+        if k in m and str(m[k]).startswith('OPPAI:'):
+            v = m[k][len('OPPAI:'):]
             try:
                 d = base64.b64decode(v).decode('utf-8')
                 dv = ''.join(chr(ord(c) ^ ord(p[i % len(p)])) for i, c in enumerate(d))
@@ -92,59 +75,50 @@ def DecryptTags(m, p):
                 t[k] = m[k]
     return t
 
-def EncryptImage(image: Image.Image, psw):
+def EncryptImage(image: Image.Image, pw):
     try:
-        width = image.width
-        height = image.height
-        x_arr = np.arange(width)
-        ShuffleArray(x_arr, psw)
-        y_arr = np.arange(height)
-        ShuffleArray(y_arr, GetSHA256(psw))
-        pixel_array = np.array(image)
+        w = image.width
+        h = image.height
+        x = np.arange(w)
+        ShuffleArray(x, pw) 
+        y = np.arange(h)
+        ShuffleArray(y, GetSHA256(pw))
+        a = np.array(image)
+        p = a.copy()
+        for v in range(h): a[v] = p[y[v]]
+        a = np.transpose(a, axes=(1, 0, 2))
+        p = a.copy()
+        for v in range(w): a[v] = p[x[v]]
+        a = np.transpose(a, axes=(1, 0, 2))
+        return a
 
-        _pixel_array = pixel_array.copy()
-        for x in range(height):
-            pixel_array[x] = _pixel_array[y_arr[x]]
-        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
-
-        _pixel_array = pixel_array.copy()
-        for x in range(width):
-            pixel_array[x] = _pixel_array[x_arr[x]]
-        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
-
-        return pixel_array
     except Exception as e:
-        if "axes don't match array" in str(e):
+        if mismatch in str(e):
             return np.array(image)
 
-def DecryptImage(image: Image.Image, psw):
+def DecryptImage(image: Image.Image, pw):
     try:
-        width = image.width
-        height = image.height
-        x_arr = np.arange(width)
-        ShuffleArray(x_arr, psw)
-        y_arr = np.arange(height)
-        ShuffleArray(y_arr, GetSHA256(psw))
-        pixel_array = np.array(image)
-
-        _pixel_array = pixel_array.copy()
-        for x in range(height):
-            pixel_array[y_arr[x]] = _pixel_array[x]
-        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
-
-        _pixel_array = pixel_array.copy()
-        for x in range(width):
-            pixel_array[x_arr[x]] = _pixel_array[x]
-        pixel_array = np.transpose(pixel_array, axes=(1, 0, 2))
-
-        return pixel_array
+        w = image.width
+        h = image.height
+        x = np.arange(w)
+        ShuffleArray(x, pw)
+        y = np.arange(h)
+        ShuffleArray(y, GetSHA256(pw))
+        a = np.array(image)
+        p = a.copy()
+        for v in range(h): a[y[v]] = p[v]
+        a = np.transpose(a, axes=(1, 0, 2))
+        p = a.copy()
+        for v in range(w): a[x[v]] = p[v]
+        a = np.transpose(a, axes=(1, 0, 2))
+        return a
 
     except Exception as e:
-        if "axes don't match array" in str(e):
+        if mismatch in str(e):
             return np.array(image)
 
 class EncryptedImage(PILImage.Image):
-    __name__ = "EncryptedImage"
+    __name__ = 'EncryptedImage'
 
     @staticmethod
     def from_image(image: PILImage.Image):
@@ -153,33 +127,26 @@ class EncryptedImage(PILImage.Image):
         img.im = image.im
         img._mode = image.mode
         if image.im.mode:
-            try:
-                img.mode = image.im.mode
-            except Exception:
-                pass
-
+            try: img.mode = image.im.mode
+            except Exception: pass
         img._size = image.size
         img.format = image.format
-        if image.mode in ("P", "PA"):
-            img.palette = image.palette.copy() if image.palette else ImagePalette.ImagePalette()
-
+        if image.mode in ('P', 'PA'): img.palette = image.palette.copy() if image.palette else ImagePalette.ImagePalette()
         img.info = image.info.copy()
         return img
 
     def save(self, fp, format=None, **params):
-        filename = ""
+        filename = ''
 
-        if isinstance(fp, Path):
-            filename = str(fp)
-        elif _util.is_path(fp):
-            filename = fp
+        if isinstance(fp, Path): filename = str(fp)
+        elif _util.is_path(fp): filename = fp
         elif fp == sys.stdout:
             try:
                 fp = sys.stdout.buffer
             except AttributeError:
                 pass
 
-        if not filename and hasattr(fp, "name") and _util.is_path(fp.name):
+        if not filename and hasattr(fp, 'name') and _util.is_path(fp.name):
             filename = fp.name
 
         if not filename or not password:
@@ -190,6 +157,14 @@ class EncryptedImage(PILImage.Image):
             super().save(fp, format=format, **params)
             return
 
+        p = Path(getattr(fp, 'name', fp)) if not isinstance(fp, Path) else fp
+        if any(base in p.parents for base in (Models, Embed)):
+            if (self.format or '').upper() != 'PNG':
+                png = PILImage.new('RGBA', self.size)
+                png.paste(self)
+                self = png
+                self.format = 'PNG'
+
         encrypted_info = EncryptTags(self.info, password)
         pnginfo = params.get('pnginfo', PngImagePlugin.PngInfo()) or PngImagePlugin.PngInfo()
 
@@ -199,9 +174,8 @@ class EncryptedImage(PILImage.Image):
         try:
             encrypted_img = PILImage.fromarray(EncryptImage(self, GetSHA256(password)))
             self.paste(encrypted_img)
-            encrypted_img.close()
         except Exception as e:
-            if "axes don't match array" in str(e):
+            if mismatch in str(e):
                 fn = Path(filename)
                 os.system(f'rm -f {fn}')
                 return
@@ -234,46 +208,43 @@ def open(fp, *args, **kwargs):
             if password and img.format.lower() == PngImagePlugin.PngImageFile.format.lower():
                 pnginfo = DecryptTags(pnginfo, password)
 
-                if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
+                if pnginfo.get('Encrypt') == 'pixel_shuffle_3':
                     decrypted_img = PILImage.fromarray(DecryptImage(img, GetSHA256(password)))
                     img.paste(decrypted_img)
                     decrypted_img.close()
-                    pnginfo["Encrypt"] = None
+                    pnginfo['Encrypt'] = None
 
             img.info = pnginfo
             return EncryptedImage.from_image(img)
 
         except Exception as e:
-            print(f"Error in 246 : {fp} : {e}")
+            print(f'Error in 234 : {fp} : {e}')
             return None
 
         finally:
             img.close()
 
     except Exception as e:
-        print(f"Error in 253 : {fp} : {e}")
+        print(f'Error in 241 : {fp} : {e}')
         return None
 
 def encode_pil_to_base64(img: PILImage.Image):
     pnginfo = img.info or {}
-
     with io.BytesIO() as output_bytes:
         pnginfo = DecryptTags(pnginfo, password)
-        if pnginfo.get("Encrypt") == 'pixel_shuffle_3':
-            img.paste(PILImage.fromarray(DecryptImage(img, GetSHA256(password))))
-
-        pnginfo["Encrypt"] = None
+        if pnginfo.get('Encrypt') == 'pixel_shuffle_3': img.paste(PILImage.fromarray(DecryptImage(img, GetSHA256(password))))
+        pnginfo['Encrypt'] = None
         img.save(output_bytes, format=PngImagePlugin.PngImageFile.format, quality=shared.opts.jpeg_quality)
         bytes_data = output_bytes.getvalue()
-
     return base64.b64encode(bytes_data)
 
+#—————————————————————————————————————————————————————————————————————————————————————————————————————————————#
 _executor = ThreadPoolExecutor(max_workers=100)
 _semaphore_factory = lambda: asyncio.Semaphore(min(os.cpu_count() * 2, 10))
 _semaphores = {}
 p_cache = {}
 
-def imgResize(image, target_height=500):
+def imgResize(image, target_height=512):
     width, height = image.size
     if height > target_height:
         aspect_ratio = width / height
@@ -298,18 +269,18 @@ async def imgAsync(fp, should_resize=False):
                     lambda: imgProcess(fp, should_resize)
                 )
             except Exception as e:
-                print(f"Error in 300 : {fp}, Error: {e}")
+                print(f'Error in 288 : {fp}, Error: {e}')
                 return None
 
             p_cache[fp] = content
             return content
     except Exception as e:
-        print(f"Error in 306 : {fp}: {e}")
+        print(f'Error in 294 : {fp}: {e}')
         try:
             with open(fp, 'rb') as f:
                 return f.read()
         except Exception as inner_e:
-            print(f"Error in 311 : {inner_e}")
+            print(f'Error in 299 : {inner_e}')
             return None
     finally:
         if fp in p_cache:
@@ -321,7 +292,7 @@ def imgProcess(fp, should_resize):
             try:
                 image.verify()
             except Exception as e:
-                print(f"Invalid image file: {fp}: {e}")
+                print(f'Invalid image file: {fp}: {e}')
                 return None
 
             if should_resize:
@@ -336,7 +307,7 @@ def imgProcess(fp, should_resize):
                     image = PILImage.open(fp)
                     pnginfo = image.info or {}
                 except Exception as e:
-                    print(f"Error in 338 : {fp}: {e}")
+                    print(f'Error in 326 : {fp}: {e}')
                     return None
 
             buffered = io.BytesIO()
@@ -358,123 +329,32 @@ def imgProcess(fp, should_resize):
                     info.add_text(key, str(value))
 
             image.save(buffered, format=PngImagePlugin.PngImageFile.format, pnginfo=info)
-            image.close()
             return buffered.getvalue()
     except Exception as e:
-        print(f"Error in 363 : {fp}: {e}")
+        print(f'Error in 350 : {fp}: {e}')
         return None
-
-def WatchDogs(paths, extensions):
-    OBS = Observer()
-    file_queue = Queue(maxsize=1000)
-    processed_files = set()
-    lock = Lock()
-    shutdown_event = Event()
-    num_cpus = os.cpu_count()
-    thread_pool = ThreadPoolExecutor(max_workers=num_cpus * 4)
-
-    def process_queue():
-        futures = []
-        while not shutdown_event.is_set():
-            try:
-                fp = file_queue.get(timeout=0.1)
-                if fp:
-                    future = thread_pool.submit(process_file, fp)
-                    futures.append(future)
-                    futures = [f for f in futures if not f.done()]
-                file_queue.task_done()
-            except Empty:
-                continue
-            except Exception as e:
-                print(f"Error in 388 : {e}")
-
-    def process_file(fp):
-        with lock:
-            if fp in processed_files:
-                return
-            processed_files.add(fp)
-        try:
-            img = PILImage.open(fp)
-            pnginfo = img.info or {}
-            if not all(k in pnginfo for k in image_keys):
-                print(f"{AR} {fp}")
-                EncryptedImage.from_image(img).save(fp)
-        except Exception as e:
-            print(f"Error in 402 : {fp} : {e}")
-            with lock:
-                processed_files.discard(fp)
-
-    class OBSHandler(FileSystemEventHandler):
-        def __init__(self):
-            super().__init__()
-            self.event_buffer = {}
-            self.last_processed = time.time()
-            self.buffer_lock = Lock()
-
-        def on_any_event(self, event):
-            if event.is_directory:
-                return
-            fp = Path(event.src_path)
-            if fp.suffix.lower() not in extensions:
-                return
-            if event.event_type in ('created', 'modified', 'moved'):
-                with self.buffer_lock:
-                    self.event_buffer[fp] = time.time()
-                current_time = time.time()
-                if current_time - self.last_processed > 0.1:
-                    self._process_buffer()
-
-        def _process_buffer(self):
-            with self.buffer_lock:
-                current_time = time.time()
-                files_to_process = []
-                for fp, timestamp in list(self.event_buffer.items()):
-                    if current_time - timestamp >= 0.1 and fp.exists():
-                        files_to_process.append(fp)
-                        del self.event_buffer[fp]
-                for fp in files_to_process:
-                    file_queue.put(fp)
-                self.last_processed = current_time
-
-    num_workers = num_cpus * 4
-    workers = []
-    for _ in range(num_workers):
-        worker = Thread(target=process_queue, daemon=True)
-        worker.start()
-        workers.append(worker)
-
-    handler = OBSHandler()
-    for path in paths:
-        OBS.schedule(handler, path, recursive=True)
-    OBS.start()
 
 async def img_req(endpoint, query, full_path, res):
-    sdhub = '/sd-hub-gallery/image='
-    if endpoint.startswith(sdhub) and (img_path := endpoint[len(sdhub):]):
-        endpoint = f'/file={img_path}'
-
-    def process_query(endpoint_path, prefixes, param):
-        if endpoint_path.startswith(prefixes):
+    def process_query(ep, pf, pr):
+        if ep.startswith(pf):
             query_string = unquote(query())
-            return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(param)), '')
+            return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(pr)), '')
         return None
 
+    sdhub = '/sd-hub-gallery/image='
+    if endpoint.startswith(sdhub) and (img_path := endpoint[len(sdhub):]): endpoint = f'/file={img_path}'
+
     path = process_query(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
-    if path:
-        endpoint = f'/file={path}'
+    if path: endpoint = f'/file={path}'
 
     fn = process_query(endpoint, '/sd_extra_networks/thumb', 'filename=')
-    if fn:
-        endpoint = f'/file={fn}'
+    if fn: endpoint = f'/file={fn}'
 
     if endpoint.startswith('/file='):
         fp = full_path(endpoint[6:])
         ext = fp.suffix.lower().split('?')[0]
-
-        if 'card-no-preview.png' in str(fp):
-            return False, None
-
-        if ext in image_extensions:
+        if 'card-no-preview.' in str(fp): return False, None
+        if ext in image_exts:
             should_resize = str(Models) in str(fp) or str(Embed) in str(fp)
             content = await imgAsync(fp, should_resize)
             if content:
@@ -482,24 +362,17 @@ async def img_req(endpoint, query, full_path, res):
 
     return False, None
 
-def hook_http_request(app: FastAPI):
-    @app.middleware("http")
+def Hook(app: FastAPI):
+    @app.middleware('http')
     async def image_decrypting(req: Request, call_next):
         endpoint = '/' + req.scope.get('path', 'err').strip('/')
-
-        def query():
-            return req.scope.get('query_string', b'').decode('utf-8')
-
-        def res(content):
-            return Response(content=content, media_type='image/png', headers=headers)
-
+        def query(): return req.scope.get('query_string', b'').decode('utf-8')
+        def res(content): return Response(content=content, media_type='image/png', headers=headers)
         lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
-        if lines:
-            return response
-
+        if lines: return response
         return await call_next(req)
 
-def hook_forge_http_request(app):
+def Hook_Forge(app):
     import starlette.responses as ass
     from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -508,33 +381,27 @@ def hook_forge_http_request(app):
             self.app = app
 
         async def __call__(self, scope: Scope, receive: Receive, send: Send):
-            if scope["type"] == "http":
+            if scope['type'] == 'http':
                 endpoint = '/' + scope.get('path', 'err').strip('/')
 
-                def query():
-                    return scope.get('query_string', b'').decode('utf-8')
-
-                def res(content):
-                    return ass.Response(content=content, media_type='image/png', headers=headers)
-
+                def query(): return scope.get('query_string', b'').decode('utf-8')
+                def res(content): return ass.Response(content=content, media_type='image/png', headers=headers)
                 lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
                 if lines:
                     await response(scope, receive, send)
                     return
 
             await self.app(scope, receive, send)
-
     app.middleware_stack = Reqs(app.middleware_stack)
 
-def image_encryption_started(_: gr.Blocks, app: FastAPI):
-    SetSharedOptions()
-
-    if not Forge:
+def App(_: gr.Blocks, app: FastAPI):
+    try:
+        from modules_forge.forge_canvas.canvas import ForgeCanvas  # type: ignore
+        Hook_Forge(app)
+    except ModuleNotFoundError:
         app.middleware_stack = None
-        hook_http_request(app)
+        Hook(app)
         app.build_middleware_stack()
-    else:
-        hook_forge_http_request(app)
 
 if PILImage.Image.__name__ != 'EncryptedImage':
     super_open = PILImage.open
@@ -547,17 +414,5 @@ if PILImage.Image.__name__ != 'EncryptedImage':
         PILImage.open = open
         api.encode_pil_to_base64 = encode_pil_to_base64
 
-    WatchDogs([Models, Embed], set(image_extensions))
-    print(f'{AR} {TITLE} \033[96mWatchdog\033[0m started')
-
-if password == '':
-    msg = f'{AR} {TITLE} {RED}Disabled{RST}, --encrypt-pass value is empty.'
-elif not password:
-    msg = f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.'
-else:
-    script_callbacks.on_app_started(image_encryption_started)
-    msg = f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v5{RST}' \
-          f'\n{AR} {TITLE} Check the release page for decrypting images in local Windows ' \
-          f'https://github.com/gutris1/sd-encrypt-image'
-
-print(msg)
+print(f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v6{RST}\n{AR} {TITLE} Check the release page for decrypting images in local Windows https://github.com/gutris1/sd-encrypt-image')
+on_app_started(App)
