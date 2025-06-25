@@ -13,5 +13,5 @@ if password == '':
 elif not password:
     print(f'{AR} {TITLE} {RED}Disabled{RST}, Missing --encrypt-pass command line argument.')
 else:
-    print(f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v6{RST}\n{AR} {TITLE} Check the release page for decrypting images in local Windows https://github.com/gutris1/sd-encrypt-image')
+    print(f'{AR} {TITLE} {BLUE}Enabled{RST} {ORG}v6{RST}\n{AR} {TITLE} Check the release page for decrypting images in local Windows https://github.com/gutris1/sd-image-encryption')
     on_app_started(App)
