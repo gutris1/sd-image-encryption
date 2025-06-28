@@ -375,18 +375,16 @@ def Hook_Forge(app):
         async def __call__(self, scope: Scope, receive: Receive, send: Send):
             if scope['type'] == 'http':
                 endpoint = '/' + scope.get('path', 'err').strip('/')
-
                 def query(): return scope.get('query_string', b'').decode('utf-8')
                 def res(content): return ass.Response(content=content, media_type='image/png', headers=headers)
                 lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
                 if lines:
                     await response(scope, receive, send)
                     return
-
             await self.app(scope, receive, send)
     app.middleware_stack = Reqs(app.middleware_stack)
 
-def App(_: gr.Blocks, app: FastAPI):
+def app(_: gr.Blocks, app: FastAPI):
     try:
         from modules_forge.forge_canvas.canvas import ForgeCanvas  # type: ignore
         Hook_Forge(app)
