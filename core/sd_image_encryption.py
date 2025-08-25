@@ -2,6 +2,7 @@ from PIL import Image as PILImage, PngImagePlugin, _util, ImagePalette
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, Request, Response
 from urllib.parse import unquote
+from packaging import version
 from pathlib import Path
 from PIL import Image
 import gradio as gr
@@ -327,19 +328,19 @@ def imgProcess(fp, should_resize):
         return None
 
 async def img_req(endpoint, query, full_path, res):
-    def process_query(ep, pf, pr):
+    def q(ep, pf, pr):
         if ep.startswith(pf):
             query_string = unquote(query())
             return next((sub.split('=')[1] for sub in query_string.split('&') if sub.startswith(pr)), '')
         return None
 
-    sdhub = '/sd-hub-gallery/image='
+    sdhub = '/sdhub-gallery-image='
     if endpoint.startswith(sdhub) and (img_path := endpoint[len(sdhub):]): endpoint = f'/file={img_path}'
 
-    path = process_query(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
+    path = q(endpoint, ('/infinite_image_browsing/image-thumbnail', '/infinite_image_browsing/file'), 'path=')
     if path: endpoint = f'/file={path}'
 
-    fn = process_query(endpoint, '/sd_extra_networks/thumb', 'filename=')
+    fn = q(endpoint, '/sd_extra_networks/thumb', 'filename=')
     if fn: endpoint = f'/file={fn}'
 
     if endpoint.startswith('/file='):
@@ -354,18 +355,21 @@ async def img_req(endpoint, query, full_path, res):
 
     return False, None
 
-def Hook(app: FastAPI):
+def hook(app: FastAPI):
     @app.middleware('http')
-    async def image_decrypting(req: Request, call_next):
+    async def _(req: Request, call_next):
         endpoint = '/' + req.scope.get('path', 'err').strip('/')
+
         def query(): return req.scope.get('query_string', b'').decode('utf-8')
         def res(content): return Response(content=content, media_type='image/png', headers=headers)
+
         lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
         if lines: return response
+
         return await call_next(req)
 
-def Hook_Forge(app):
-    import starlette.responses as ass
+def hook_starlette(app: FastAPI):
+    import starlette.responses as stares
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     class Reqs:
@@ -375,22 +379,25 @@ def Hook_Forge(app):
         async def __call__(self, scope: Scope, receive: Receive, send: Send):
             if scope['type'] == 'http':
                 endpoint = '/' + scope.get('path', 'err').strip('/')
+
                 def query(): return scope.get('query_string', b'').decode('utf-8')
-                def res(content): return ass.Response(content=content, media_type='image/png', headers=headers)
+                def res(content): return stares.Response(content=content, media_type='image/png', headers=headers)
+
                 lines, response = await img_req(endpoint=endpoint, query=query, full_path=Path, res=res)
                 if lines:
                     await response(scope, receive, send)
                     return
+
             await self.app(scope, receive, send)
+
     app.middleware_stack = Reqs(app.middleware_stack)
 
 def app(_: gr.Blocks, app: FastAPI):
-    try:
-        from modules_forge.forge_canvas.canvas import ForgeCanvas  # type: ignore
-        Hook_Forge(app)
-    except ModuleNotFoundError:
+    if version.parse(gr.__version__).major > 3:
+        hook_starlette(app)
+    else:
         app.middleware_stack = None
-        Hook(app)
+        hook(app)
         app.build_middleware_stack()
 
 if PILImage.Image.__name__ != 'EncryptedImage':
